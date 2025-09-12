@@ -1,10 +1,12 @@
 #include <dirent.h>
-#include <errno.h> // Para usar a variável 'errno' em erros
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define PORTA_CONTROLE 1025
@@ -17,8 +19,12 @@ int criar_e_definir_socket_inet(struct sockaddr_in *endereco, in_addr_t ip,
                                 in_port_t porta);
 int interpretar_executar_comando(char *comando, int cliente_fd_controle,
                                  int dados_fd);
+int mandar_arquivo(int client_fd, const char *filepath, const char *status_line,
+                   const char *extra_headers);
+int send_all(int fd, const void *buf, size_t len);
 
 int main(int argc, char *argv[]) {
+  char *path = "index.html";
 
   // Variaveis
   int controle_fd, dados_fd, cliente_fd;
@@ -41,7 +47,6 @@ int main(int argc, char *argv[]) {
     exit(-1);
   printf("Servidor pronto para transferir dados na porta %d...\n", PORTA_DADOS);
 
-  // Loop principal para aceitar novas conexões de clientes
   while (1) {
 
     cliente_fd = accept(controle_fd, (struct sockaddr *)&endereco_controle,
@@ -53,9 +58,44 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\nCliente conectado!\n");
-    send(cliente_fd, "Conexão estabelecida com sucesso!",
-         strlen("Conexão estabelecida com sucesso!"), 0);
 
+    char req[2048];
+    ssize_t n = recv(cliente_fd, req, sizeof(req) - 1, 0);
+    req[n] = '\0';
+
+    char method[8], path[1024], version[16];
+    if (sscanf(req, "%7s %1023s %15s", method, path, version) != 3) {
+      const char bad[] =
+          "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+      send_all(cliente_fd, bad, sizeof(bad) - 1);
+      close(cliente_fd);
+      continue;
+    }
+
+    if (strcmp(method, "GET") != 0) {
+      const char only_get[] =
+          "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
+      send_all(cliente_fd, only_get, sizeof(only_get) - 1);
+      close(cliente_fd);
+      continue;
+    }
+
+    if (strcmp(path, "/") == 0) {
+      if (mandar_arquivo(cliente_fd, "./www/index.html", "HTTP/1.1 200 OK",
+                         "Content-Type: text/html\r\n") < 0) {
+        const char nf[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+        send_all(cliente_fd, nf, sizeof(nf) - 1);
+      }
+    } else if (strcmp(path, "/app.js") == 0) {
+      if (mandar_arquivo(cliente_fd, "./www/app.js", "HTTP/1.1 200 OK",
+                         "Content-Type: application/javascript\r\n") < 0) {
+        const char nf[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+        send_all(cliente_fd, nf, sizeof(nf) - 1);
+      }
+    } else {
+      const char nf[] = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
+      send_all(cliente_fd, nf, sizeof(nf) - 1);
+    }
     // Loop para tratar os comandos do cliente conectado
     while (1) {
       memset(buffer, 0, TAMANHO_BUFFER); // Limpa o buffer
@@ -272,4 +312,59 @@ int criar_e_definir_socket_inet(struct sockaddr_in *endereco, in_addr_t ip,
   }
 
   return fd;
+}
+
+int send_all(int fd, const void *buf, size_t len) {
+  const char *p = (const char *)buf;
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t n = send(fd, p + sent, len - sent, 0);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    if (n == 0)
+      break;
+    sent += (size_t)n;
+  }
+  return 0;
+}
+
+int mandar_arquivo(int cliente_fd, const char *filepath,
+                   const char *status_line, const char *extra_headers) {
+  int f = open(filepath, O_RDONLY);
+  if (f < 0)
+    return -1;
+
+  struct stat st;
+  if (fstat(f, &st) < 0) {
+    close(f);
+    return -1;
+  }
+
+  char hdr[512];
+  int n = snprintf(hdr, sizeof(hdr),
+                   "%s\r\n"
+                   "Content-Length: %lld\r\n"
+                   "Connection: close\r\n"
+                   "%s"
+                   "\r\n",
+                   status_line, (long long)st.st_size,
+                   (extra_headers ? extra_headers : ""));
+  if (send_all(cliente_fd, hdr, (size_t)n) < 0) {
+    close(f);
+    return -1;
+  }
+
+  char buf[8192];
+  ssize_t r;
+  while ((r = read(f, buf, sizeof(buf))) > 0) {
+    if (send_all(cliente_fd, buf, (size_t)r) < 0) {
+      close(f);
+      return -1;
+    }
+  }
+  close(f);
+  return 0;
 }
